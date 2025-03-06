@@ -45,6 +45,7 @@ import (
 )
 
 const metricEndpointFmt = "http://localhost:%v/metrics"
+const supportedMachineRegex = regexp.MustCompile("^projects/[0-9]+/machineTypes/(a3|a4|ct5l|ct5lp|ct5p|ct6e)-.*$")
 
 // Mounter will be used in the sidecar container to invoke gcsfuse.
 type Mounter struct {
@@ -97,6 +98,17 @@ func (m *Mounter) Mount(ctx context.Context, mc *MountConfig) error {
 		klog.V(4).Infof("sending SIGTERM to gcsfuse process: %v", cmd)
 
 		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+
+	machineType, err := getMachineType()
+	if err != nil {
+		klog.Warningf("Unable to fetch machine-type, ignoring: %v", err)
+	}
+
+	// check machine-type
+	if supportedMachineRegex.Find(*supportedMachineTypes, machineType) {
+		mc.ConfigFileFlagMap["gcsfuse-metadata-prefetch-on-mount"] = "true"
+		klog.Infof("Machine type is %v, enabling gcsfuse-metadata-prefetch-on-mount", machineType)
 	}
 
 	// when the ctx.Done() is closed,
@@ -152,6 +164,32 @@ func (m *Mounter) Mount(ctx context.Context, mc *MountConfig) error {
 	}()
 
 	return nil
+}
+
+func getMachineType() (string, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, "http://metadata.google.internal/computeMetadata/v1/instance/machine-type", nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get machine type: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %v", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return string(body), nil
 }
 
 // logMemoryUsage logs gcsfuse process VmRSS (Resident Set Size) usage every 30 seconds.
