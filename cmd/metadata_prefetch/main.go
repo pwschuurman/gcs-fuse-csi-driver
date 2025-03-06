@@ -20,9 +20,13 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -31,6 +35,10 @@ import (
 
 const (
 	mountPathsLocation = "/volumes/"
+)
+
+var (
+	supportedMachineRegex = regexp.MustCompile("^projects/[0-9]+/machineTypes/(a3|a4|ct5l|ct5lp|ct5p|ct6e)-.*$")
 )
 
 func main() {
@@ -52,35 +60,78 @@ func main() {
 		os.Exit(0) // Exit gracefully
 	}()
 
-	// Start the "ls" command in the background.
-	// All our volumes are mounted under the /volumes/ directory.
-	cmd := exec.CommandContext(ctx, "ls", "-R", mountPathsLocation)
-	cmd.Stdout = nil // Connects file descriptor to the null device (os.DevNull).
+	machineType, err := getMachineType(ctx)
+	if err != nil {
+		klog.Warningf("Unable to fetch machine-type, ignoring: %v", err)
+	}
 
-	// TODO(hime): We should research stratergies to parallelize ls execution and speed up cache population.
-	err := cmd.Start()
-	if err == nil {
-		mountPaths, err := getDirectoryNames(mountPathsLocation)
-		if err == nil {
-			klog.Infof("Running ls on mountPath(s): %s", strings.Join(mountPaths, ", "))
-		} else {
-			klog.Warningf("failed to get mountPaths: %v", err)
-		}
-
-		err = cmd.Wait()
-		if err != nil {
-			klog.Errorf("Error while executing ls command: %v", err)
-		} else {
-			klog.Info("Metadata prefetch complete")
-		}
+	val := os.Getenv("USER_ENABLED_METADATA_PREFETCH")
+	enablePrefetch := true
+	if val == "TRUE" {
+		enablePrefetch = true
+	} else if val == "FALSE" {
+		enablePrefetch = false
 	} else {
-		klog.Errorf("Error starting ls command: %v.", err)
+		// Defaulting scenario, env var unset.
+		enablePrefetch = supportedMachineRegex.MatchString(machineType)
+	}
+
+	if enablePrefetch {
+		// Start the "ls" command in the background.
+		// All our volumes are mounted under the /volumes/ directory.
+		cmd := exec.CommandContext(ctx, "ls", "-R", mountPathsLocation)
+		cmd.Stdout = nil // Connects file descriptor to the null device (os.DevNull).
+
+		// TODO(hime): We should research stratergies to parallelize ls execution and speed up cache population.
+		err := cmd.Start()
+		if err == nil {
+			mountPaths, err := getDirectoryNames(mountPathsLocation)
+			if err == nil {
+				klog.Infof("Running ls on mountPath(s): %s", strings.Join(mountPaths, ", "))
+			} else {
+				klog.Warningf("failed to get mountPaths: %v", err)
+			}
+
+			err = cmd.Wait()
+			if err != nil {
+				klog.Errorf("Error while executing ls command: %v", err)
+			} else {
+				klog.Info("Metadata prefetch complete")
+			}
+		} else {
+			klog.Errorf("Error starting ls command: %v.", err)
+		}
 	}
 
 	klog.Info("Going to sleep...")
 
 	// Keep the process running.
 	select {}
+}
+
+func getMachineType(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://metadata.google.internal/computeMetadata/v1/instance/machine-type", nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get machine type: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %v", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return string(body), nil
 }
 
 // getDirectoryNames returns a list of strings representing the names of
